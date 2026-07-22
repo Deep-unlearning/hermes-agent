@@ -156,10 +156,13 @@ Speak normally. Partial transcription appears in the CLI status line. The voice 
 - “Run the tests” delegates to the current Hermes session and speaks its eventual result.
 - “What are you doing?” reads the foreground tool activity, elapsed time, queued requests, and background-task count without interrupting Hermes.
 - “Focus on the failing integration test” steers the active turn after its next tool call.
-- “By the way, inspect the API logs” starts a separate `/btw` background task and announces its result when it finishes.
+- “By the way, inspect the API logs” starts a separate `/btw` background task and announces its ID and eventual result.
+- “List my background tasks,” “steer task one to focus on errors,” and “stop task one” manage `/btw` work by spoken number or ID.
 - “Stop the Hermes task” cancels foreground work. Interrupting only the spoken response does not cancel Hermes.
 
-New delegated work is queued when the foreground session is already busy. Dangerous commands accept only explicit approval phrases such as “approve once” or “deny”; password and secret prompts remain keyboard-only.
+The safe slash-command guide is generated from Hermes's current command registry, so aliases such as `/bg` and `/btw` do not drift from the CLI. New delegated work is queued when the foreground session is already busy. During long-running foreground or background work, S2S proactively speaks a fresh factual update every 30 seconds by default. Dangerous commands accept only explicit approval phrases such as “approve once” or “deny”; password and secret prompts remain keyboard-only.
+
+If the Realtime connection drops—or the server reports that all session slots are occupied—S2S remains enabled and reconnects with exponential backoff. Results completed during a disconnect remain queued for the next connection. Use `/s2s off` to stop retrying.
 
 Commands:
 
@@ -185,6 +188,12 @@ s2s:
   block_mic_during_playback: false # false enables barge-in
   max_spoken_chars: 4000
   connect_timeout: 5.0
+  progress_announcements: true
+  progress_interval: 30.0
+  reconnect_enabled: true
+  reconnect_attempts: 0             # 0 = retry until /s2s off
+  reconnect_initial_delay: 1.0
+  reconnect_max_delay: 15.0
 ```
 
 ---

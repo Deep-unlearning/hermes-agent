@@ -404,6 +404,8 @@ class TestCliApprovalUi:
 
         assert task_id.startswith("bg_")
         assert completion == ["done"]
+        assert cli._background_task_info[task_id]["status"] == "completed"
+        assert cli._background_task_info[task_id]["response"] == "done"
         assert seen["approval"].__self__ is cli
         assert seen["approval"].__func__ is HermesCLI._approval_callback
         assert seen["sudo"].__self__ is cli

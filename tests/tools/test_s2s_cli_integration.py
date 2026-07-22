@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,9 @@ def _make_cli():
     cli._agent_running = False
     cli.agent = None
     cli._background_tasks = {}
+    cli._background_task_info = {}
+    cli._background_task_lock = threading.RLock()
+    cli._background_task_counter = 0
     cli._prompt_start_time = None
     cli._spinner_text = ""
     cli._tool_start_time = 0.0
@@ -159,6 +163,20 @@ def test_steer_control_updates_active_agent_without_queueing_new_turn():
     assert "steered" in ack.message
 
 
+def test_queue_control_defers_a_voice_task_and_preserves_result_identity():
+    cli = _make_cli()
+    call = S2SControlCall(
+        "queue_hermes_task", "queue-1", message="run the integration tests later"
+    )
+
+    ack = cli._on_s2s_control(call)
+
+    queued = cli._pending_input.get_nowait()
+    assert queued == S2STurn("run the integration tests later", "queue-1")
+    assert ack.await_result is True
+    assert "queued" in ack.message
+
+
 def test_stop_control_interrupts_active_agent_and_clears_prompts():
     cli = _make_cli()
     cli._agent_running = True
@@ -191,6 +209,72 @@ def test_background_control_uses_btw_and_announces_completion():
     assert command == "/btw inspect the test failures"
     assert ack.await_result is True
     assert mode.responses == [("background-1", "Tests are passing.")]
+
+
+def test_background_controls_list_and_stop_one_task_by_spoken_number():
+    cli = _make_cli()
+    stop_event = threading.Event()
+    background_agent = SimpleNamespace(
+        interrupt=MagicMock(), steer=MagicMock(return_value=True)
+    )
+    cli._background_task_info["bg_123"] = {
+        "task_id": "bg_123",
+        "number": 1,
+        "prompt": "inspect the logs",
+        "status": "running",
+        "activity": "reading server.log",
+        "response": "",
+        "started_at": time.time() - 12,
+        "finished_at": None,
+        "agent": background_agent,
+        "stop_event": stop_event,
+    }
+
+    status = cli._on_s2s_control(
+        S2SControlCall("get_background_tasks", "list-1")
+    )
+    steered = cli._on_s2s_control(
+        S2SControlCall(
+            "steer_background_task",
+            "steer-bg-1",
+            message="focus on errors",
+            task_id="one",
+        )
+    )
+    stopped = cli._on_s2s_control(
+        S2SControlCall("stop_background_task", "stop-bg-1", task_id="one")
+    )
+
+    assert "Task 1" in status.message
+    assert "reading server.log" in status.message
+    assert "Steered background task 1" in steered.message
+    assert "Stopping background task 1" in stopped.message
+    assert stop_event.is_set()
+    background_agent.interrupt.assert_called_once_with()
+    background_agent.steer.assert_called_once_with("focus on errors")
+    assert cli._background_task_info["bg_123"]["status"] == "stopping"
+
+
+def test_progress_provider_reports_background_activity_when_foreground_is_idle():
+    cli = _make_cli()
+    cli._background_task_info["bg_456"] = {
+        "task_id": "bg_456",
+        "number": 2,
+        "prompt": "run integration tests",
+        "status": "running",
+        "activity": "executing pytest",
+        "response": "",
+        "started_at": time.time() - 20,
+        "finished_at": None,
+        "agent": None,
+        "stop_event": threading.Event(),
+    }
+
+    progress = cli._get_s2s_progress_announcement()
+
+    assert progress is not None
+    assert "Background progress" in progress
+    assert "executing pytest" in progress
 
 
 def test_s2s_command_routes_to_mode_lifecycle():

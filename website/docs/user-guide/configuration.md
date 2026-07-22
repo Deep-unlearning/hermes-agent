@@ -1679,9 +1679,15 @@ s2s:
   output_device: null
   block_mic_during_playback: false # keep barge-in enabled
   max_spoken_chars: 4000
+  progress_announcements: true
+  progress_interval: 30.0
+  reconnect_enabled: true
+  reconnect_attempts: 0            # 0 = unlimited
+  reconnect_initial_delay: 1.0
+  reconnect_max_delay: 15.0
 ```
 
-Start an OpenAI Realtime-compatible speech-to-speech server, then run `/s2s on` in the interactive CLI. The voice model automatically handles lightweight conversation or delegates computer work to the current CLI agent, where live tool progress and streamed output remain visible. Spoken controls can report foreground progress, steer or stop the active turn, and start `/btw` background work. `/s2s status` shows the connection and `/s2s off` releases the audio devices.
+Start an OpenAI Realtime-compatible speech-to-speech server, then run `/s2s on` in the interactive CLI. The voice model automatically handles lightweight conversation or delegates computer work to the current CLI agent, where live tool progress and streamed output remain visible. Spoken controls can report foreground progress, steer or stop the active turn, and start, inspect, steer, or stop `/btw` background work. During continuous work, a fresh status summary is spoken at `progress_interval`; stale summaries are dropped when the task finishes. Connection loss and “all session slots are in use” errors retry with bounded exponential backoff. `/s2s status` shows the connection and `/s2s off` releases the audio devices.
 
 ## Streaming
 

@@ -299,6 +299,23 @@ class CLICommandsMixin:
                     f"{d.get('status', '?')} · {goal}"
                 )
 
+        registry, lock = self._ensure_background_task_registry()
+        with lock:
+            background_agents = [dict(record) for record in registry.values()]
+        if background_agents:
+            background_agents.sort(key=lambda record: int(record.get("number", 0)))
+            running_agents = [
+                record for record in background_agents
+                if record.get("status") in {"running", "stopping"}
+            ]
+            _cprint(f"  /background tasks: {len(running_agents)} running")
+            for record in background_agents[-5:]:
+                prompt = " ".join(str(record.get("prompt") or "").split())[:60]
+                _cprint(
+                    f"    #{record.get('number', '?')} · {record.get('task_id', '?')} · "
+                    f"{record.get('status', '?')} · {prompt}"
+                )
+
         agent_running = getattr(self, "_agent_running", False)
         _cprint(f"  Agent: {'running' if agent_running else 'idle'}")
 
@@ -1621,6 +1638,175 @@ class CLICommandsMixin:
         from cli import save_config_value
         save_config_value(f"{subsystem}.write_approval", bool(enabled))
 
+    def _ensure_background_task_registry(self):
+        """Return the metadata registry and lock, including for legacy instances."""
+        if not hasattr(self, "_background_task_info"):
+            self._background_task_info = {}
+        if not hasattr(self, "_background_task_lock"):
+            self._background_task_lock = threading.RLock()
+        return self._background_task_info, self._background_task_lock
+
+    @staticmethod
+    def _normalize_background_task_reference(reference: str) -> str:
+        value = str(reference or "").lower().strip().lstrip("#")
+        if value.startswith("background task "):
+            value = value[16:].strip().lstrip("#")
+        if value.startswith("task "):
+            value = value[5:].strip().lstrip("#")
+        number_words = {
+            "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        }
+        if value in {"background task", "the background task", "the task"}:
+            return "current"
+        return number_words.get(value, value)
+
+    def _resolve_background_task_info(self, reference: str):
+        registry, lock = self._ensure_background_task_registry()
+        normalized = self._normalize_background_task_reference(reference)
+        with lock:
+            records = [dict(record) for record in registry.values()]
+        if not normalized:
+            return None, "No background task was specified."
+        if normalized in {"current", "latest", "last"}:
+            active = [
+                record for record in records
+                if record.get("status") in {"running", "stopping"}
+            ]
+            pool = active or records
+            matches = (
+                [max(pool, key=lambda record: int(record.get("number", 0)))]
+                if pool
+                else []
+            )
+        elif normalized.isdigit():
+            matches = [
+                record for record in records
+                if str(record.get("number", "")) == normalized
+            ]
+        else:
+            matches = [
+                record for record in records
+                if str(record.get("task_id", "")).lower() == normalized
+            ]
+            if not matches:
+                matches = [
+                    record for record in records
+                    if str(record.get("task_id", "")).lower().startswith(normalized)
+                ]
+        if len(matches) == 1:
+            return matches[0], ""
+        if len(matches) > 1:
+            return None, f"Background task reference {reference} is ambiguous."
+        return None, f"No background task matches {reference}."
+
+    @staticmethod
+    def _background_task_elapsed(record: dict) -> int:
+        started = record.get("started_at")
+        if not isinstance(started, (int, float)):
+            return 0
+        finished = record.get("finished_at")
+        end = finished if isinstance(finished, (int, float)) else time.time()
+        return max(0, int(end - started))
+
+    def _background_task_status_text(self, reference: str = "") -> str:
+        """Return a concise status report for voice and CLI consumers."""
+        registry, lock = self._ensure_background_task_registry()
+        if reference:
+            record, error = self._resolve_background_task_info(reference)
+            if record is None:
+                return error
+            records = [record]
+        else:
+            with lock:
+                records = [dict(record) for record in registry.values()]
+            if not records:
+                return "There are no current or recent Hermes background tasks."
+            records.sort(
+                key=lambda record: (
+                    record.get("status") not in {"running", "stopping"},
+                    -int(record.get("number", 0)),
+                )
+            )
+            records = records[:5]
+
+        lines = []
+        for record in records:
+            number = record.get("number", "?")
+            task_id = record.get("task_id", "unknown")
+            status = record.get("status", "unknown")
+            elapsed = self._background_task_elapsed(record)
+            prompt = " ".join(str(record.get("prompt") or "").split())[:100]
+            activity = " ".join(str(record.get("activity") or "").split())[:100]
+            line = (
+                f"Task {number}, ID {task_id}, is {status} after {elapsed} seconds. "
+                f"Request: {prompt or 'not available'}."
+            )
+            if activity and status in {"running", "stopping"}:
+                line += f" Current activity: {activity}."
+            if reference and status in {"completed", "failed", "cancelled"}:
+                result = " ".join(str(record.get("response") or "").split())[:300]
+                if result:
+                    line += f" Result: {result}."
+            lines.append(line)
+        return " ".join(lines)
+
+    def _stop_background_task_by_reference(self, reference: str) -> str:
+        """Request cancellation of one /background agent by number or ID."""
+        record, error = self._resolve_background_task_info(reference)
+        if record is None:
+            return error
+        task_id = record["task_id"]
+        registry, lock = self._ensure_background_task_registry()
+        with lock:
+            live = registry.get(task_id)
+            if live is None:
+                return f"Background task {reference} is no longer available."
+            status = live.get("status")
+            if status not in {"running", "stopping"}:
+                return f"Background task {live.get('number', reference)} is already {status}."
+            live["status"] = "stopping"
+            stop_event = live.get("stop_event")
+            agent = live.get("agent")
+        if stop_event is not None:
+            stop_event.set()
+        if agent is not None:
+            try:
+                agent.interrupt()
+            except Exception as exc:
+                logger.debug("Could not interrupt background task %s: %s", task_id, exc)
+        return f"Stopping background task {record.get('number')}, ID {task_id}."
+
+    def _steer_background_task_by_reference(self, reference: str, message: str) -> str:
+        """Queue guidance for one running /background agent."""
+        record, error = self._resolve_background_task_info(reference)
+        if record is None:
+            return error
+        task_id = record["task_id"]
+        registry, lock = self._ensure_background_task_registry()
+        with lock:
+            live = registry.get(task_id)
+            if live is None:
+                return f"Background task {reference} is no longer available."
+            status = live.get("status")
+            if status != "running":
+                return f"Background task {live.get('number', reference)} is {status}."
+            agent = live.get("agent")
+            if agent is None:
+                live.setdefault("pending_guidance", []).append(message)
+                return (
+                    f"Queued guidance for background task {live.get('number')}; "
+                    "it will be applied when the agent starts."
+                )
+        try:
+            accepted = bool(agent.steer(message))
+        except Exception as exc:
+            logger.debug("Could not steer background task %s: %s", task_id, exc)
+            return f"Could not steer background task {record.get('number')}: {exc}"
+        if not accepted:
+            return f"Background task {record.get('number')} rejected empty guidance."
+        return f"Steered background task {record.get('number')}, ID {task_id}."
+
     def _handle_background_command(self, cmd: str, completion_callback=None):
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -1641,6 +1827,7 @@ class CLICommandsMixin:
         self._background_task_counter += 1
         task_num = self._background_task_counter
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        stop_event = threading.Event()
 
         # Make sure we have valid credentials
         if not self._ensure_runtime_credentials():
@@ -1652,6 +1839,31 @@ class CLICommandsMixin:
         _cprint("  You can continue chatting — results will appear when done.\n")
 
         turn_route = self._resolve_turn_agent_config(prompt)
+        registry, registry_lock = self._ensure_background_task_registry()
+        with registry_lock:
+            finished = sorted(
+                (
+                    record for record in registry.values()
+                    if record.get("status") not in {"running", "stopping"}
+                ),
+                key=lambda record: float(record.get("finished_at") or 0),
+            )
+            while len(registry) >= 20 and finished:
+                oldest = finished.pop(0)
+                registry.pop(oldest["task_id"], None)
+            registry[task_id] = {
+                "task_id": task_id,
+                "number": task_num,
+                "prompt": prompt,
+                "status": "running",
+                "activity": "starting",
+                "response": "",
+                "started_at": time.time(),
+                "finished_at": None,
+                "agent": None,
+                "stop_event": stop_event,
+                "pending_guidance": [],
+            }
 
         def run_background():
             completion_text = ""
@@ -1690,10 +1902,24 @@ class CLICommandsMixin:
                     openrouter_min_coding_score=self._openrouter_min_coding_score,
                     fallback_model=self._fallback_model,
                 )
+                with registry_lock:
+                    if task_id in registry:
+                        registry[task_id]["agent"] = bg_agent
+                        registry[task_id]["activity"] = "initializing the agent"
+                        pending_guidance = list(
+                            registry[task_id].pop("pending_guidance", [])
+                        )
+                    else:
+                        pending_guidance = []
+                for guidance in pending_guidance:
+                    bg_agent.steer(guidance)
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
 
                 def _bg_thinking(text: str) -> None:
+                    with registry_lock:
+                        if task_id in registry and text:
+                            registry[task_id]["activity"] = text
                     # Concurrent bg tasks may race on _spinner_text; acceptable for best-effort UI.
                     if not self._agent_running:
                         self._spinner_text = text
@@ -1701,6 +1927,9 @@ class CLICommandsMixin:
                             self._app.invalidate()
 
                 bg_agent.thinking_callback = _bg_thinking
+
+                if stop_event.is_set():
+                    bg_agent.interrupt()
 
                 result = bg_agent.run_conversation(
                     user_message=prompt,
@@ -1710,7 +1939,18 @@ class CLICommandsMixin:
                 response = result.get("final_response", "") if result else ""
                 if not response and result and result.get("error"):
                     response = f"Error: {result['error']}"
-                completion_text = response or "The background task completed without a response."
+                was_stopped = stop_event.is_set()
+                completion_text = (
+                    f"Background task {task_num} was stopped."
+                    if was_stopped
+                    else response or "The background task completed without a response."
+                )
+                with registry_lock:
+                    if task_id in registry:
+                        registry[task_id]["status"] = (
+                            "cancelled" if was_stopped else "completed"
+                        )
+                        registry[task_id]["response"] = completion_text
 
                 # Display result in the CLI (thread-safe via patch_stdout).
                 # Force a TUI refresh first so spinner/status bar don't overlap
@@ -1720,7 +1960,10 @@ class CLICommandsMixin:
                     time.sleep(0.05)  # brief pause for refresh
                 print()
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
-                _cprint(f"  ✅ Background task #{task_num} complete")
+                if was_stopped:
+                    _cprint(f"  ⏹ Background task #{task_num} stopped")
+                else:
+                    _cprint(f"  ✅ Background task #{task_num} complete")
                 _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 if response:
@@ -1755,13 +1998,27 @@ class CLICommandsMixin:
                     sys.stdout.flush()
 
             except Exception as e:
-                completion_text = f"The background task failed: {e}"
+                was_stopped = stop_event.is_set()
+                completion_text = (
+                    f"Background task {task_num} was stopped."
+                    if was_stopped
+                    else f"The background task failed: {e}"
+                )
+                with registry_lock:
+                    if task_id in registry:
+                        registry[task_id]["status"] = (
+                            "cancelled" if was_stopped else "failed"
+                        )
+                        registry[task_id]["response"] = completion_text
                 # Same TUI refresh pattern as success path (#2718)
                 if self._app:
                     self._app.invalidate()
                     time.sleep(0.05)
                 print()
-                _cprint(f"  ❌ Background task #{task_num} failed: {e}")
+                if was_stopped:
+                    _cprint(f"  ⏹ Background task #{task_num} stopped")
+                else:
+                    _cprint(f"  ❌ Background task #{task_num} failed: {e}")
             finally:
                 try:
                     set_sudo_password_callback(None)
@@ -1769,6 +2026,17 @@ class CLICommandsMixin:
                     set_secret_capture_callback(None)
                 except Exception:
                     pass
+                with registry_lock:
+                    if task_id in registry:
+                        record = registry[task_id]
+                        if record.get("status") in {"running", "stopping"}:
+                            record["status"] = (
+                                "cancelled" if stop_event.is_set() else "failed"
+                            )
+                        record["finished_at"] = time.time()
+                        record["agent"] = None
+                        record["activity"] = ""
+                        record["response"] = completion_text
                 self._background_tasks.pop(task_id, None)
                 # Clear spinner only if no foreground agent owns it
                 if not self._agent_running:

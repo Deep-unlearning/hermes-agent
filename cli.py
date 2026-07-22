@@ -4226,6 +4226,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
+        self._background_task_info: Dict[str, dict] = {}
+        self._background_task_lock = threading.RLock()
         self._background_task_counter = 0
 
     def _claim_active_session(self, surface: str = "cli", *, stderr: bool = False) -> bool:
@@ -10988,12 +10990,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return bool(mode and mode.is_running)
 
     def _on_s2s_state(self, state: str, detail: str = "") -> None:
-        was_active = getattr(self, "_s2s_state", "off") in {"listening", "speaking"}
+        was_active = getattr(self, "_s2s_state", "off") in {
+            "listening", "speaking", "working"
+        }
         self._s2s_state = state
         if state == "error":
             self._s2s_last_error = detail
             if was_active:
                 _cprint(f"\n{_DIM}S2S connection error: {detail}{_RST}")
+        elif state == "reconnecting":
+            self._s2s_last_error = detail
+            if was_active:
+                _cprint(f"\n{_DIM}S2S reconnecting: {detail}{_RST}")
+        elif state in {"listening", "speaking"}:
+            self._s2s_last_error = ""
         self._invalidate(min_interval=0.0)
 
     def _on_s2s_transcript(self, text: str, final: bool) -> None:
@@ -11092,9 +11102,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"{detail}{queue_detail}{background}"
         )
 
+    def _get_s2s_progress_announcement(self) -> str | None:
+        """Return fresh work status, or None when there is nothing to announce."""
+        if (
+            getattr(self, "_agent_running", False)
+            or getattr(self, "_approval_state", None)
+            or getattr(self, "_clarify_state", None)
+            or getattr(self, "_sudo_state", None)
+            or getattr(self, "_secret_state", None)
+        ):
+            return self._get_s2s_live_status()
+
+        registry, lock = self._ensure_background_task_registry()
+        with lock:
+            active = [
+                str(record.get("task_id")) for record in registry.values()
+                if record.get("status") in {"running", "stopping"}
+            ]
+        if not active:
+            return None
+        details = [self._background_task_status_text(task_id) for task_id in active[:3]]
+        return "Background progress: " + " ".join(details)
+
     def _on_s2s_control(self, call):
         """Execute a scoped voice control without bypassing Hermes safeguards."""
-        from tools.s2s_mode import S2STurnAck
+        from tools.s2s_mode import S2STurn, S2STurnAck
 
         if call.name == "get_hermes_status":
             return S2STurnAck(self._get_s2s_live_status(), await_result=False)
@@ -11119,6 +11151,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     await_result=False,
                 )
             return S2STurnAck("Hermes rejected the empty guidance.", await_result=False)
+
+        if call.name == "queue_hermes_task":
+            self._pending_input.put(S2STurn(call.message, call.call_id))
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck(
+                "I queued that as the next Hermes foreground task.",
+                await_result=True,
+            )
 
         if call.name == "stop_hermes":
             agent = getattr(self, "agent", None)
@@ -11146,11 +11186,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     "Hermes could not start the background task. Check the terminal for details.",
                     await_result=False,
                 )
+            record, _ = self._resolve_background_task_info(task_id)
+            task_number = record.get("number", "?") if record else "?"
             self._invalidate(min_interval=0.0)
             return S2STurnAck(
-                "I started that as a separate Hermes background task. You can keep talking while it runs.",
+                f"I started Hermes background task {task_number}, "
+                f"ID {task_id}. You can keep talking while it runs.",
                 await_result=True,
             )
+
+        if call.name == "get_background_tasks":
+            return S2STurnAck(
+                self._background_task_status_text(call.task_id), await_result=False
+            )
+
+        if call.name == "stop_background_task":
+            acknowledgement = self._stop_background_task_by_reference(call.task_id)
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck(acknowledgement, await_result=False)
+
+        if call.name == "steer_background_task":
+            acknowledgement = self._steer_background_task_by_reference(
+                call.task_id, call.message
+            )
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck(acknowledgement, await_result=False)
 
         return S2STurnAck("That voice control is not supported.", await_result=False)
 
@@ -11235,7 +11295,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         raw = load_config().get("s2s")
         config = S2SConfig.from_mapping(raw if isinstance(raw, dict) else {})
-        requirements = check_s2s_requirements(config)
+        requirements = check_s2s_requirements(
+            config, probe_server=not config.reconnect_enabled
+        )
         if not requirements["available"]:
             _cprint(f"\n{_ACCENT}S2S mode is unavailable:{_RST}")
             for line in requirements["details"].splitlines():
@@ -11253,6 +11315,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             on_control=self._on_s2s_control,
             on_transcript=self._on_s2s_transcript,
             on_state=self._on_s2s_state,
+            on_progress=self._get_s2s_progress_announcement,
         )
         self._s2s_mode = mode
         self._s2s_last_error = ""
@@ -11266,7 +11329,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         voice_label = f" ({config.voice})" if config.voice else ""
         _cprint(f"\n{_ACCENT}S2S mode enabled{voice_label}{_RST}")
-        _cprint(f"  {_DIM}Connected to {config.host}:{config.port}; speak when ready.{_RST}")
+        if mode.is_connected:
+            _cprint(f"  {_DIM}Connected to {config.host}:{config.port}; speak when ready.{_RST}")
+        else:
+            _cprint(
+                f"  {_DIM}Waiting for a free S2S session at {config.host}:{config.port}; "
+                f"reconnection is automatic.{_RST}"
+            )
         _cprint(f"  {_DIM}Voice turns now run in this CLI session with live tool updates.{_RST}")
         _cprint(f"  {_DIM}/s2s off to disconnect.{_RST}")
 
@@ -11294,6 +11363,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"  Model:    {config.model}")
         _cprint(f"  Voice:    {config.voice or 'server default'}")
         _cprint(f"  Audio:    {config.send_rate} Hz in / {config.recv_rate} Hz out")
+        _cprint(
+            f"  Progress: {'every ' + f'{config.progress_interval:g}s' if config.progress_announcements else 'off'}"
+        )
+        _cprint(
+            f"  Reconnect: {'on' if config.reconnect_enabled else 'off'}"
+            f" ({'unlimited' if config.reconnect_attempts == 0 else config.reconnect_attempts} attempts)"
+        )
         if self._s2s_last_error:
             _cprint(f"  Error:    {self._s2s_last_error}")
         if not requirements["available"]:

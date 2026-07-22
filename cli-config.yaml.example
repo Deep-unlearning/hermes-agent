@@ -1067,6 +1067,12 @@ s2s:
   block_mic_during_playback: false # false keeps barge-in enabled
   max_spoken_chars: 4000
   connect_timeout: 5.0
+  progress_announcements: true     # speak a factual update during long work
+  progress_interval: 30.0          # seconds of continuous work before updates
+  reconnect_enabled: true          # recover after disconnects/session-slot errors
+  reconnect_attempts: 0            # 0 = retry until /s2s off
+  reconnect_initial_delay: 1.0
+  reconnect_max_delay: 15.0
 
 # Text-to-speech. Only the deepinfra block is documented here — the
 # remaining providers (edge, openai, xai, minimax, mistral, gemini,
