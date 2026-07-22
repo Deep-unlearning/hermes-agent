@@ -1045,6 +1045,27 @@ stt:
   #   # live result. Pin only when you need a specific Whisper variant.
   #   model: ""
 
+# =============================================================================
+# Realtime Speech-to-Speech (CLI)
+# =============================================================================
+# Connect /s2s mode to a local OpenAI Realtime-compatible speech pipeline.
+# Voice turns are submitted to the current CLI agent/session, so tool activity
+# and streamed output remain visible here. Install Hermes audio support with
+# `pip install 'hermes-agent[voice]'` and start the S2S server separately.
+s2s:
+  host: "127.0.0.1"
+  port: 8765
+  model: "local"
+  voice: ""                      # Server default, or e.g. af_heart / bm_fable
+  send_rate: 16000
+  recv_rate: 16000
+  chunk_size: 1024
+  input_device: null              # sounddevice index; null = system default
+  output_device: null
+  block_mic_during_playback: false # false keeps barge-in enabled
+  max_spoken_chars: 4000
+  connect_timeout: 5.0
+
 # Text-to-speech. Only the deepinfra block is documented here — the
 # remaining providers (edge, openai, xai, minimax, mistral, gemini,
 # elevenlabs, neutts, kittentts, piper) inherit sensible defaults from

@@ -4195,6 +4195,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_continuous = False
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
+        self._s2s_mode = None
+        self._s2s_state = "off"
+        self._s2s_partial = ""
+        self._s2s_last_error = ""
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -5232,6 +5236,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         tts = " | TTS on" if self._voice_tts else ""
         cont = " | Continuous" if self._voice_continuous else ""
         return [("class:voice-status", f" 🎤 Voice mode{tts}{cont}  —  {label} to record ")]
+
+    def _get_s2s_status_fragments(self, width: Optional[int] = None):
+        """Return live S2S connection/transcription state for the TUI."""
+        width = width or self._get_tui_terminal_width()
+        state = getattr(self, "_s2s_state", "off")
+        partial = getattr(self, "_s2s_partial", "").strip()
+        if partial:
+            prefix = " 🎙 "
+            available = max(8, width - len(prefix) - 2)
+            text = partial if len(partial) <= available else partial[: available - 1] + "…"
+            return [("class:s2s-status-live", f"{prefix}{text} ")]
+        labels = {
+            "connecting": "connecting…",
+            "working": "Hermes working…",
+            "speaking": "speaking…",
+            "error": "connection error",
+        }
+        label = labels.get(state, "listening")
+        return [("class:s2s-status", f" 🎙 S2S {label}  —  /s2s off to disconnect ")]
 
     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
         """Return a compact one-line session status string for the TUI footer."""
@@ -9320,6 +9343,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif canonical == "s2s":
+            self._handle_s2s_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
         else:
@@ -10958,6 +10983,197 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     # Voice mode methods
     # ====================================================================
 
+    def _s2s_is_running(self) -> bool:
+        mode = getattr(self, "_s2s_mode", None)
+        return bool(mode and mode.is_running)
+
+    def _on_s2s_state(self, state: str, detail: str = "") -> None:
+        was_active = getattr(self, "_s2s_state", "off") in {"listening", "speaking"}
+        self._s2s_state = state
+        if state == "error":
+            self._s2s_last_error = detail
+            if was_active:
+                _cprint(f"\n{_DIM}S2S connection error: {detail}{_RST}")
+        self._invalidate(min_interval=0.0)
+
+    def _on_s2s_transcript(self, text: str, final: bool) -> None:
+        self._s2s_partial = text.strip()
+        if final and self._s2s_partial:
+            self._s2s_state = "working"
+        self._invalidate(min_interval=0.0)
+
+    @staticmethod
+    def _s2s_approval_choice(message: str, choices: list[str]) -> str | None:
+        normalized = " ".join(message.lower().strip(" .!?").split())
+        deny_phrases = {
+            "no", "deny", "deny it", "reject", "reject it", "cancel",
+            "do not allow", "don't allow", "do not approve", "don't approve",
+        }
+        if normalized in deny_phrases and "deny" in choices:
+            return "deny"
+        if any(phrase in normalized for phrase in ("always allow", "allow always", "approve always")):
+            return "always" if "always" in choices else None
+        if "session" in normalized and any(word in normalized for word in ("allow", "approve", "yes")):
+            return "session" if "session" in choices else None
+        approve_phrases = {
+            "yes", "approve", "approve it", "approve once", "allow", "allow it",
+            "allow once", "go ahead", "yes go ahead",
+        }
+        if normalized in approve_phrases and "once" in choices:
+            return "once"
+        return None
+
+    def _complete_s2s_turn(self, call_id: str | None, response: str | None) -> None:
+        if not call_id:
+            return
+        mode = getattr(self, "_s2s_mode", None)
+        if mode and mode.is_running:
+            mode.deliver_response(call_id, response)
+
+    def _on_s2s_turn(self, turn):
+        """Route a Realtime tool call through this CLI's live interaction state."""
+        from tools.s2s_mode import S2STurnAck
+
+        self._s2s_partial = ""
+
+        # Dangerous-command approvals remain deterministic: only explicit
+        # allow/deny phrases are accepted by voice, and only choices actually
+        # offered by the active approval prompt can be selected.
+        approval = getattr(self, "_approval_state", None)
+        if approval:
+            choices = approval.get("choices") if isinstance(approval, dict) else []
+            choices = choices if isinstance(choices, list) else []
+            verdict = self._s2s_approval_choice(turn.message, choices)
+            if verdict:
+                approval["response_queue"].put(verdict)
+                self._approval_state = None
+                acknowledgement = (
+                    "Approved the command once." if verdict == "once" else
+                    "Denied the command." if verdict == "deny" else
+                    f"Approved the command for {verdict}."
+                )
+            else:
+                acknowledgement = (
+                    "Hermes is waiting for a command approval. Say approve once or deny."
+                )
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck(acknowledgement, await_result=False)
+
+        # Clarification answers are ordinary text and can safely flow straight
+        # into the active clarify callback.
+        clarify = getattr(self, "_clarify_state", None)
+        if clarify and isinstance(clarify, dict):
+            clarify["response_queue"].put(turn.message)
+            self._clarify_state = None
+            self._clarify_freetext = False
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck("Passed your answer to Hermes.", await_result=False)
+
+        # Password and secret prompts deliberately stay keyboard-only.
+        if getattr(self, "_sudo_state", None) or getattr(self, "_secret_state", None):
+            return S2STurnAck(
+                "Hermes is waiting for secure keyboard input in the terminal.",
+                await_result=False,
+            )
+
+        # Exact stop phrases act as barge-in without turning arbitrary requests
+        # containing the word "stop" into interrupts.
+        normalized = " ".join(turn.message.lower().strip(" .!?").split())
+        if (
+            getattr(self, "_agent_running", False)
+            and getattr(self, "agent", None)
+            and normalized in {"stop", "stop it", "cancel", "cancel it", "interrupt"}
+        ):
+            self.agent.interrupt()
+            return S2STurnAck("Stopping Hermes now.", await_result=False)
+
+        was_busy = bool(getattr(self, "_agent_running", False))
+        self._pending_input.put(turn)
+        self._invalidate(min_interval=0.0)
+        if was_busy:
+            return S2STurnAck(
+                "Hermes is still working, so I queued your request as the next CLI turn."
+            )
+        return S2STurnAck(
+            "Hermes received your request and is working in the terminal."
+        )
+
+    def _enable_s2s_mode(self) -> None:
+        if self._s2s_is_running():
+            _cprint(f"{_DIM}S2S mode is already enabled.{_RST}")
+            return
+        if getattr(self, "_voice_mode", False):
+            _cprint(f"{_DIM}Turn off push-to-talk voice mode first: /voice off{_RST}")
+            return
+
+        from hermes_cli.config import load_config
+        from tools.s2s_mode import S2SConfig, S2SMode, check_s2s_requirements
+
+        raw = load_config().get("s2s")
+        config = S2SConfig.from_mapping(raw if isinstance(raw, dict) else {})
+        requirements = check_s2s_requirements(config)
+        if not requirements["available"]:
+            _cprint(f"\n{_ACCENT}S2S mode is unavailable:{_RST}")
+            for line in requirements["details"].splitlines():
+                _cprint(f"  {_DIM}{line}{_RST}")
+            if requirements["missing_packages"]:
+                _cprint(
+                    f"  {_DIM}Install audio support with: "
+                    f"{sys.executable} -m pip install 'hermes-agent[voice]'{_RST}"
+                )
+            return
+
+        mode = S2SMode(
+            config,
+            on_turn=self._on_s2s_turn,
+            on_transcript=self._on_s2s_transcript,
+            on_state=self._on_s2s_state,
+        )
+        self._s2s_mode = mode
+        self._s2s_last_error = ""
+        try:
+            mode.start()
+        except Exception as exc:
+            self._s2s_mode = None
+            self._s2s_state = "off"
+            self._s2s_last_error = str(exc)
+            _cprint(f"\n{_ACCENT}Could not enable S2S mode:{_RST} {_DIM}{exc}{_RST}")
+            return
+        voice_label = f" ({config.voice})" if config.voice else ""
+        _cprint(f"\n{_ACCENT}S2S mode enabled{voice_label}{_RST}")
+        _cprint(f"  {_DIM}Connected to {config.host}:{config.port}; speak when ready.{_RST}")
+        _cprint(f"  {_DIM}Voice turns now run in this CLI session with live tool updates.{_RST}")
+        _cprint(f"  {_DIM}/s2s off to disconnect.{_RST}")
+
+    def _disable_s2s_mode(self) -> None:
+        mode = getattr(self, "_s2s_mode", None)
+        if mode:
+            mode.stop()
+        self._s2s_mode = None
+        self._s2s_state = "off"
+        self._s2s_partial = ""
+        self._invalidate(min_interval=0.0)
+        _cprint(f"\n{_DIM}S2S mode disabled.{_RST}")
+
+    def _show_s2s_status(self) -> None:
+        from hermes_cli.config import load_config
+        from tools.s2s_mode import S2SConfig, check_s2s_requirements
+
+        raw = load_config().get("s2s")
+        config = S2SConfig.from_mapping(raw if isinstance(raw, dict) else {})
+        requirements = check_s2s_requirements(config, probe_server=False)
+        _cprint(f"\n{_BOLD}S2S Mode Status{_RST}")
+        _cprint(f"  Mode:     {'ON' if self._s2s_is_running() else 'OFF'}")
+        _cprint(f"  State:    {getattr(self, '_s2s_state', 'off')}")
+        _cprint(f"  Server:   {config.host}:{config.port}")
+        _cprint(f"  Model:    {config.model}")
+        _cprint(f"  Voice:    {config.voice or 'server default'}")
+        _cprint(f"  Audio:    {config.send_rate} Hz in / {config.recv_rate} Hz out")
+        if self._s2s_last_error:
+            _cprint(f"  Error:    {self._s2s_last_error}")
+        if not requirements["available"]:
+            _cprint(f"  {_DIM}{requirements['details']}{_RST}")
+
     def _voice_start_recording(self):
         """Start capturing audio from the microphone."""
         if getattr(self, '_should_exit', False):
@@ -11270,6 +11486,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Enable voice mode after checking requirements."""
         if self._voice_mode:
             _cprint(f"{_DIM}Voice mode is already enabled.{_RST}")
+            return
+        if self._s2s_is_running():
+            _cprint(f"{_DIM}Turn off realtime S2S mode first: /s2s off{_RST}")
             return
 
         from tools.voice_mode import check_voice_requirements, detect_audio_environment
@@ -12948,6 +13167,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return _state_fragment("class:prompt-working", self._command_spinner_frame())
         if self._agent_running:
             return _state_fragment("class:prompt-working", "⚕")
+        if self._s2s_is_running():
+            return _state_fragment("class:voice-prompt", "🎙")
         if self._voice_mode:
             return _state_fragment("class:voice-prompt", "🎤")
         return [("class:prompt", symbol)]
@@ -13301,6 +13522,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_continuous = False  # Whether to auto-restart after agent responds
         self._voice_tts_done = threading.Event()  # Signals TTS playback finished
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
+        self._s2s_mode = None       # Realtime S2SMode instance (lazy init)
+        self._s2s_state = "off"
+        self._s2s_partial = ""
+        self._s2s_last_error = ""
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
@@ -14876,6 +15101,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Persistent voice mode status bar (visible only when voice mode is on)
         def _get_voice_status():
+            if cli_ref._s2s_is_running():
+                return cli_ref._get_s2s_status_fragments()
             return cli_ref._get_voice_status_fragments()
 
         voice_status_bar = ConditionalContainer(
@@ -14883,7 +15110,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 FormattedTextControl(_get_voice_status),
                 height=1,
             ),
-            filter=Condition(lambda: cli_ref._voice_mode),
+            filter=Condition(lambda: cli_ref._voice_mode or cli_ref._s2s_is_running()),
         )
 
         status_bar = ConditionalContainer(
@@ -14991,6 +15218,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'voice-processing': '#FFA500 italic',
             'voice-status': 'bg:#1a1a2e #87CEEB',
             'voice-status-recording': 'bg:#1a1a2e #FF4444 bold',
+            's2s-status': 'bg:#1a1a2e #87CEEB',
+            's2s-status-live': 'bg:#1a1a2e #FFD700 bold',
         }
         style = PTStyle.from_dict(self._build_tui_style_dict())
 
@@ -15148,6 +15377,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if not user_input:
                         continue
 
+                    # S2S tool calls enter through the same queue as typed
+                    # input, but carry a Realtime call_id so the final Hermes
+                    # response can be returned to the speech pipeline.
+                    s2s_call_id = None
+                    try:
+                        from tools.s2s_mode import S2STurn
+                        if isinstance(user_input, S2STurn):
+                            s2s_call_id = user_input.call_id
+                            user_input = user_input.message
+                    except ImportError:
+                        pass
+
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
@@ -15237,9 +15478,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_reasoning = False
                     app.invalidate()  # Refresh status line
 
+                    response = None
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        response = self.chat(user_input, images=submit_images or None)
                     finally:
+                        self._complete_s2s_turn(s2s_call_id, response)
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
@@ -15551,6 +15794,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.agent.interrupt()
                 except Exception:
                     pass
+            # Stop realtime S2S before releasing audio and terminal resources.
+            _s2s_mode = getattr(self, '_s2s_mode', None)
+            if _s2s_mode is not None:
+                try:
+                    _s2s_mode.stop()
+                except Exception:
+                    pass
+                self._s2s_mode = None
             # Shut down voice recorder (release persistent audio stream)
             if hasattr(self, '_voice_recorder') and self._voice_recorder:
                 try:

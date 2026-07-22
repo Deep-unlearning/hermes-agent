@@ -2286,6 +2286,24 @@ DEFAULT_CONFIG = {
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
     },
+
+    # Full-duplex CLI speech through a local OpenAI Realtime-compatible
+    # speech-to-speech server. Unlike the standalone gateway bridge, S2S turns
+    # run in this CLI's current agent/session so live tool progress stays visible.
+    "s2s": {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "model": "local",
+        "voice": "",
+        "send_rate": 16000,
+        "recv_rate": 16000,
+        "chunk_size": 1024,
+        "input_device": None,
+        "output_device": None,
+        "block_mic_during_playback": False,
+        "max_spoken_chars": 4000,
+        "connect_timeout": 5.0,
+    },
     
     "human_delay": {
         "mode": "off",

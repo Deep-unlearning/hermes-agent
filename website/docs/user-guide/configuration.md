@@ -1665,6 +1665,24 @@ voice:
 
 Use `/voice on` in the CLI to enable microphone mode, `record_key` to start/stop recording, and `/voice tts` to toggle spoken replies. See [Voice Mode](/user-guide/features/voice-mode) for end-to-end setup and platform-specific behavior.
 
+## Realtime Speech-to-Speech (CLI)
+
+```yaml
+s2s:
+  host: "127.0.0.1"
+  port: 8765
+  model: "local"
+  voice: ""                       # server default
+  send_rate: 16000
+  recv_rate: 16000
+  input_device: null
+  output_device: null
+  block_mic_during_playback: false # keep barge-in enabled
+  max_spoken_chars: 4000
+```
+
+Start an OpenAI Realtime-compatible speech-to-speech server, then run `/s2s on` in the interactive CLI. Unlike a separate gateway bridge, voice turns use the current CLI agent and session, so live tool progress and streamed output remain visible. `/s2s status` shows the connection and `/s2s off` releases the audio devices.
+
 ## Streaming
 
 Stream tokens to the terminal or messaging platforms as they arrive, instead of waiting for the full response.

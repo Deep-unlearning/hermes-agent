@@ -31,6 +31,7 @@ A paid [Nous Portal](/user-guide/features/tool-gateway) subscription supplies th
 | Feature | Platform | Description |
 |---------|----------|-------------|
 | **Interactive Voice** | CLI | Press Ctrl+B to record, agent auto-detects silence and responds |
+| **Realtime S2S** | CLI | Full-duplex speech through a local Realtime server, with native CLI tool updates |
 | **Auto Voice Reply** | Telegram, Discord | Agent sends spoken audio alongside text responses |
 | **Voice Channel** | Discord | Bot joins VC, listens to users speaking, speaks replies back |
 
@@ -104,6 +105,79 @@ ELEVENLABS_API_KEY=***           # ElevenLabs — premium quality
 :::tip
 If `faster-whisper` is installed, voice mode works with **zero API keys** for STT. The model (~150 MB for `base`) downloads automatically on first use.
 :::
+
+---
+
+## Realtime S2S Mode (CLI)
+
+Realtime S2S mode is a full-duplex alternative to push-to-talk. It connects Hermes to an [OpenAI Realtime-compatible `speech-to-speech` server](https://github.com/huggingface/speech-to-speech), sends the voice model one scoped `send_to_hermes` tool, and routes that tool into the current CLI agent.
+
+This routing is important: Hermes does not start a separate gateway run. The current terminal continues to show streaming text, tool starts/completions, approval prompts, and the same persistent session history while microphone input and spoken output run continuously.
+
+### Start a server
+
+Install Hermes' optional audio support first:
+
+```bash
+python -m pip install 'hermes-agent[voice]'
+```
+
+Then start `speech-to-speech` in realtime mode. This Apple Silicon example uses local Parakeet STT and Qwen3 TTS, with a tool-capable Hugging Face Inference Providers model:
+
+```bash
+git clone https://github.com/huggingface/speech-to-speech.git
+cd speech-to-speech
+uv sync
+
+export HF_TOKEN=your-hugging-face-token
+uv run speech-to-speech \
+  --mode realtime \
+  --stt parakeet-tdt \
+  --llm_backend chat-completions \
+  --tts qwen3 \
+  --qwen3_tts_mlx_quantization 6bit \
+  --model_name google/gemma-4-31B-it:cerebras \
+  --responses_api_base_url https://router.huggingface.co/v1 \
+  --responses_api_api_key "$HF_TOKEN" \
+  --responses_api_reasoning_effort none \
+  --responses_api_stream \
+  --enable_live_transcription
+```
+
+Leave that process running. In a second terminal:
+
+```text
+hermes
+/s2s on
+```
+
+Speak normally. Partial transcription appears in the CLI status line; the final request enters Hermes as a normal turn, and Hermes' result is returned to the S2S server for speech. Say an explicit “stop” to interrupt an active turn. Dangerous commands accept only explicit approval phrases such as “approve once” or “deny”; password and secret prompts remain keyboard-only.
+
+Commands:
+
+- `/s2s on` — connect and open microphone/speaker streams
+- `/s2s status` — show server, model, audio rates, and connection state
+- `/s2s off` — disconnect and release audio devices
+
+Push-to-talk `/voice` mode and realtime `/s2s` mode are mutually exclusive because both own the microphone and speaker.
+
+### S2S configuration
+
+```yaml
+s2s:
+  host: "127.0.0.1"
+  port: 8765
+  model: "local"
+  voice: ""                       # server default, or e.g. af_heart
+  send_rate: 16000
+  recv_rate: 16000
+  chunk_size: 1024
+  input_device: null               # sounddevice index; null = default
+  output_device: null
+  block_mic_during_playback: false # false enables barge-in
+  max_spoken_chars: 4000
+  connect_timeout: 5.0
+```
 
 ---
 

@@ -2810,3 +2810,24 @@ class CLICommandsMixin:
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
             _cprint("Usage: /voice [on|off|tts|status]")
+
+    def _handle_s2s_command(self, command: str):
+        """Handle /s2s [on|off|status] command."""
+        from cli import _cprint
+
+        parts = command.strip().split(maxsplit=1)
+        subcommand = parts[1].lower().strip() if len(parts) > 1 else ""
+        if subcommand == "on":
+            self._enable_s2s_mode()
+        elif subcommand == "off":
+            self._disable_s2s_mode()
+        elif subcommand == "status":
+            self._show_s2s_status()
+        elif subcommand == "":
+            if self._s2s_is_running():
+                self._disable_s2s_mode()
+            else:
+                self._enable_s2s_mode()
+        else:
+            _cprint(f"Unknown S2S subcommand: {subcommand}")
+            _cprint("Usage: /s2s [on|off|status]")
