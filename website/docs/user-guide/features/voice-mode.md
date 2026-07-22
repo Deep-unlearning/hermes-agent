@@ -110,9 +110,9 @@ If `faster-whisper` is installed, voice mode works with **zero API keys** for ST
 
 ## Realtime S2S Mode (CLI)
 
-Realtime S2S mode is a full-duplex alternative to push-to-talk. It connects Hermes to an [OpenAI Realtime-compatible `speech-to-speech` server](https://github.com/huggingface/speech-to-speech), sends the voice model one scoped `send_to_hermes` tool, and routes that tool into the current CLI agent.
+Realtime S2S mode is a full-duplex alternative to push-to-talk. It connects Hermes to an [OpenAI Realtime-compatible `speech-to-speech` server](https://github.com/huggingface/speech-to-speech). The voice model acts as an intelligent controller: it can handle lightweight conversation itself, delegate computer work to the current CLI agent, report live progress, steer or stop the foreground turn, and start `/btw` background work.
 
-This routing is important: Hermes does not start a separate gateway run. The current terminal continues to show streaming text, tool starts/completions, approval prompts, and the same persistent session history while microphone input and spoken output run continuously.
+Foreground delegation does not start a separate gateway run. The current terminal continues to show streaming text, tool starts/completions, approval prompts, and the same persistent session history while microphone input and spoken output run continuously. Shell commands and other computer actions always pass through Hermes, preserving its command approval policy.
 
 ### Start a server
 
@@ -151,7 +151,15 @@ hermes
 /s2s on
 ```
 
-Speak normally. Partial transcription appears in the CLI status line; the final request enters Hermes as a normal turn, and Hermes' result is returned to the S2S server for speech. Say an explicit “stop” to interrupt an active turn. Dangerous commands accept only explicit approval phrases such as “approve once” or “deny”; password and secret prompts remain keyboard-only.
+Speak normally. Partial transcription appears in the CLI status line. The voice controller automatically chooses the appropriate path:
+
+- “Run the tests” delegates to the current Hermes session and speaks its eventual result.
+- “What are you doing?” reads the foreground tool activity, elapsed time, queued requests, and background-task count without interrupting Hermes.
+- “Focus on the failing integration test” steers the active turn after its next tool call.
+- “By the way, inspect the API logs” starts a separate `/btw` background task and announces its result when it finishes.
+- “Stop the Hermes task” cancels foreground work. Interrupting only the spoken response does not cancel Hermes.
+
+New delegated work is queued when the foreground session is already busy. Dangerous commands accept only explicit approval phrases such as “approve once” or “deny”; password and secret prompts remain keyboard-only.
 
 Commands:
 

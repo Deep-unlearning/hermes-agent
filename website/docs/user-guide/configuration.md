@@ -1681,7 +1681,7 @@ s2s:
   max_spoken_chars: 4000
 ```
 
-Start an OpenAI Realtime-compatible speech-to-speech server, then run `/s2s on` in the interactive CLI. Unlike a separate gateway bridge, voice turns use the current CLI agent and session, so live tool progress and streamed output remain visible. `/s2s status` shows the connection and `/s2s off` releases the audio devices.
+Start an OpenAI Realtime-compatible speech-to-speech server, then run `/s2s on` in the interactive CLI. The voice model automatically handles lightweight conversation or delegates computer work to the current CLI agent, where live tool progress and streamed output remain visible. Spoken controls can report foreground progress, steer or stop the active turn, and start `/btw` background work. `/s2s status` shows the connection and `/s2s off` releases the audio devices.
 
 ## Streaming
 

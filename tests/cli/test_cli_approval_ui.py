@@ -359,6 +359,12 @@ class TestCliApprovalUi:
         """
         cli = _make_background_cli_stub()
         seen = {}
+        completion = []
+        completion_ready = threading.Event()
+
+        def on_complete(text):
+            completion.append(text)
+            completion_ready.set()
 
         class FakeAgent:
             def __init__(self, **kwargs):
@@ -384,7 +390,9 @@ class TestCliApprovalUi:
              patch.object(cli_module, "_cprint"), \
              patch.object(cli_module, "ChatConsole") as chat_console:
             chat_console.return_value.print = MagicMock()
-            cli._handle_background_command("/btw check weather")
+            task_id = cli._handle_background_command(
+                "/btw check weather", completion_callback=on_complete
+            )
 
             # Join the worker thread deterministically rather than polling a
             # wall-clock deadline — under load the thread's finally-block pop
@@ -392,6 +400,10 @@ class TestCliApprovalUi:
             for _thread in list(cli._background_tasks.values()):
                 _thread.join(timeout=10)
 
+            assert completion_ready.wait(timeout=10)
+
+        assert task_id.startswith("bg_")
+        assert completion == ["done"]
         assert seen["approval"].__self__ is cli
         assert seen["approval"].__func__ is HermesCLI._approval_callback
         assert seen["sudo"].__self__ is cli
@@ -768,4 +780,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

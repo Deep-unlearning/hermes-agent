@@ -11030,6 +11030,130 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if mode and mode.is_running:
             mode.deliver_response(call_id, response)
 
+    @staticmethod
+    def _format_s2s_elapsed(seconds: float) -> str:
+        elapsed = max(0, int(seconds))
+        if elapsed < 60:
+            return f"{elapsed} second{'s' if elapsed != 1 else ''}"
+        minutes, remaining = divmod(elapsed, 60)
+        if minutes < 60:
+            return f"{minutes} minute{'s' if minutes != 1 else ''} {remaining} seconds"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} hour{'s' if hours != 1 else ''} {minutes} minutes"
+
+    def _get_s2s_live_status(self) -> str:
+        """Build a concise, truthful snapshot for the voice-side status tool."""
+        if getattr(self, "_approval_state", None):
+            return "Hermes is waiting for command approval in the terminal."
+        if getattr(self, "_clarify_state", None):
+            return "Hermes is waiting for your answer to a clarification question."
+        if getattr(self, "_sudo_state", None) or getattr(self, "_secret_state", None):
+            return "Hermes is waiting for secure keyboard input in the terminal."
+
+        try:
+            background_count = len(getattr(self, "_background_tasks", {}) or {})
+        except Exception:
+            background_count = 0
+        background = (
+            f" {background_count} background task"
+            f"{'s are' if background_count != 1 else ' is'} also running."
+            if background_count
+            else ""
+        )
+
+        if not getattr(self, "_agent_running", False):
+            if background_count:
+                return "The foreground Hermes session is idle." + background
+            return "Hermes is idle and ready for a new task."
+
+        started = getattr(self, "_prompt_start_time", None)
+        elapsed = time.time() - started if isinstance(started, (int, float)) else 0.0
+        activity = str(getattr(self, "_spinner_text", "") or "").strip()
+        tool_started = getattr(self, "_tool_start_time", 0.0) or 0.0
+        if activity and tool_started:
+            detail = f" Current tool activity: {activity}."
+        elif activity:
+            detail = f" Current activity: {activity}."
+        else:
+            detail = " Hermes is between tool calls or waiting for a model response."
+
+        try:
+            queued = getattr(self, "_pending_input", None)
+            queued_count = queued.qsize() if queued is not None else 0
+        except Exception:
+            queued_count = 0
+        queue_detail = (
+            f" {queued_count} request{'s are' if queued_count != 1 else ' is'} queued next."
+            if queued_count
+            else ""
+        )
+        return (
+            f"Hermes has been working for {self._format_s2s_elapsed(elapsed)}."
+            f"{detail}{queue_detail}{background}"
+        )
+
+    def _on_s2s_control(self, call):
+        """Execute a scoped voice control without bypassing Hermes safeguards."""
+        from tools.s2s_mode import S2STurnAck
+
+        if call.name == "get_hermes_status":
+            return S2STurnAck(self._get_s2s_live_status(), await_result=False)
+
+        if call.name == "steer_hermes":
+            agent = getattr(self, "agent", None)
+            if not getattr(self, "_agent_running", False) or agent is None:
+                return S2STurnAck(
+                    "Hermes is not running a foreground task. Send this as a new task instead.",
+                    await_result=False,
+                )
+            try:
+                accepted = bool(agent.steer(call.message))
+            except Exception as exc:
+                return S2STurnAck(
+                    f"Hermes could not accept that guidance: {exc}", await_result=False
+                )
+            if accepted:
+                self._invalidate(min_interval=0.0)
+                return S2STurnAck(
+                    "I steered the active Hermes task. The guidance will arrive after its next tool call.",
+                    await_result=False,
+                )
+            return S2STurnAck("Hermes rejected the empty guidance.", await_result=False)
+
+        if call.name == "stop_hermes":
+            agent = getattr(self, "agent", None)
+            if not getattr(self, "_agent_running", False) or agent is None:
+                return S2STurnAck(
+                    "Hermes has no active foreground task to stop.", await_result=False
+                )
+            agent.interrupt()
+            self._clear_active_overlays_for_interrupt()
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck("Stopping the active Hermes task now.", await_result=False)
+
+        if call.name == "start_background_task":
+            mode = getattr(self, "_s2s_mode", None)
+
+            def announce_completion(response: str) -> None:
+                if mode and mode.is_running:
+                    mode.deliver_response(call.call_id, response)
+
+            task_id = self._handle_background_command(
+                f"/btw {call.message}", completion_callback=announce_completion
+            )
+            if not task_id:
+                return S2STurnAck(
+                    "Hermes could not start the background task. Check the terminal for details.",
+                    await_result=False,
+                )
+            self._invalidate(min_interval=0.0)
+            return S2STurnAck(
+                "I started that as a separate Hermes background task. You can keep talking while it runs.",
+                await_result=True,
+            )
+
+        return S2STurnAck("That voice control is not supported.", await_result=False)
+
     def _on_s2s_turn(self, turn):
         """Route a Realtime tool call through this CLI's live interaction state."""
         from tools.s2s_mode import S2STurnAck
@@ -11126,6 +11250,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         mode = S2SMode(
             config,
             on_turn=self._on_s2s_turn,
+            on_control=self._on_s2s_control,
             on_transcript=self._on_s2s_transcript,
             on_state=self._on_s2s_state,
         )

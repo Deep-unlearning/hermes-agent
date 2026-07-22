@@ -15,6 +15,7 @@ Import discipline (mirrors gateway/slash_commands.py, PR #41886):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -38,6 +39,8 @@ from hermes_cli.browser_connect import (
     local_port_in_use,
     manual_chrome_debug_command,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CLICommandsMixin:
@@ -1618,12 +1621,13 @@ class CLICommandsMixin:
         from cli import save_config_value
         save_config_value(f"{subsystem}.write_approval", bool(enabled))
 
-    def _handle_background_command(self, cmd: str):
+    def _handle_background_command(self, cmd: str, completion_callback=None):
         """Handle /background <prompt> — run a prompt in a separate background session.
 
         Spawns a new AIAgent in a background thread with its own session.
         When it completes, prints the result to the CLI without modifying
-        the active session's conversation history.
+        the active session's conversation history. ``completion_callback`` is
+        used by realtime voice mode to announce a voice-originated result.
         """
         from cli import AIAgent, ChatConsole, _accent_hex, _cprint, _maybe_remap_for_light_mode, _render_final_assistant_content, set_approval_callback, set_secret_capture_callback, set_sudo_password_callback
         parts = cmd.strip().split(maxsplit=1)
@@ -1631,7 +1635,7 @@ class CLICommandsMixin:
             _cprint("  Usage: /background <prompt>")
             _cprint("  Example: /background Summarize the top HN stories today")
             _cprint("  The task runs in a separate session and results display here when done.")
-            return
+            return None
 
         prompt = parts[1].strip()
         self._background_task_counter += 1
@@ -1641,7 +1645,7 @@ class CLICommandsMixin:
         # Make sure we have valid credentials
         if not self._ensure_runtime_credentials():
             _cprint("  (>_<) Cannot start background task: no valid credentials.")
-            return
+            return None
 
         _cprint(f"  🔄 Background task #{task_num} started: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
         _cprint(f"  Task ID: {task_id}")
@@ -1650,6 +1654,7 @@ class CLICommandsMixin:
         turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
+            completion_text = ""
             set_sudo_password_callback(self._sudo_password_callback)
             set_approval_callback(self._approval_callback)
             try:
@@ -1705,6 +1710,7 @@ class CLICommandsMixin:
                 response = result.get("final_response", "") if result else ""
                 if not response and result and result.get("error"):
                     response = f"Error: {result['error']}"
+                completion_text = response or "The background task completed without a response."
 
                 # Display result in the CLI (thread-safe via patch_stdout).
                 # Force a TUI refresh first so spinner/status bar don't overlap
@@ -1749,6 +1755,7 @@ class CLICommandsMixin:
                     sys.stdout.flush()
 
             except Exception as e:
+                completion_text = f"The background task failed: {e}"
                 # Same TUI refresh pattern as success path (#2718)
                 if self._app:
                     self._app.invalidate()
@@ -1768,10 +1775,18 @@ class CLICommandsMixin:
                     self._spinner_text = ""
                 if self._app:
                     self._invalidate(min_interval=0)
+                if completion_callback is not None:
+                    try:
+                        completion_callback(completion_text)
+                    except Exception:
+                        logger.debug(
+                            "Background completion callback failed", exc_info=True
+                        )
 
         thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
+        return task_id
 
     def _handle_bundles_command(self, cmd: str) -> None:
         """In-session ``/bundles`` — show installed skill bundles.

@@ -1049,9 +1049,11 @@ stt:
 # Realtime Speech-to-Speech (CLI)
 # =============================================================================
 # Connect /s2s mode to a local OpenAI Realtime-compatible speech pipeline.
-# Voice turns are submitted to the current CLI agent/session, so tool activity
-# and streamed output remain visible here. Install Hermes audio support with
-# `pip install 'hermes-agent[voice]'` and start the S2S server separately.
+# The voice model handles lightweight conversation or delegates computer work
+# to the current CLI agent/session. It can also report live status, steer/stop
+# foreground work, and start /btw tasks. Tool activity and streamed output stay
+# visible here. Install audio support with `pip install 'hermes-agent[voice]'`
+# and start the S2S server separately.
 s2s:
   host: "127.0.0.1"
   port: 8765

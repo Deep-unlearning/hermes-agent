@@ -1,10 +1,12 @@
 """Realtime speech-to-speech transport for the Hermes CLI.
 
 This module connects the interactive CLI to a speech-to-speech server that
-implements the OpenAI Realtime protocol.  The voice model receives one tool,
-``send_to_hermes``.  Tool calls are handed back to the *current* CLI instead of
-starting a separate gateway run, which keeps Hermes' normal live tool output,
-approvals, and session history visible in the terminal.
+implements the OpenAI Realtime protocol.  The voice model acts as a small,
+spoken control plane: it can answer lightweight conversation itself, delegate
+computer work to the current Hermes session, inspect live progress, steer or
+stop the active turn, and start an independent background task.  Computer work
+still goes through Hermes so normal tool output, approvals, and session history
+remain visible in the terminal.
 
 The heavy audio dependency is optional and imported only when the mode starts.
 Install it with ``pip install hermes-agent[voice]``.
@@ -26,12 +28,47 @@ from typing import Any, Callable, Mapping
 logger = logging.getLogger(__name__)
 
 
+def _safe_spoken_text(value: Any) -> str:
+    """Force-redact secrets at the audio egress boundary."""
+    text = str(value or "")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            text, force=True, redact_url_credentials=True
+        )
+    except Exception:
+        logger.debug("Could not redact S2S speech output", exc_info=True)
+        return "Hermes produced output that could not be safely prepared for speech."
+
+
 S2S_INSTRUCTIONS = """\
-You are the realtime spoken interface for Hermes, the computer agent running in
-this terminal. For every user request, call send_to_hermes exactly once with a
-faithful, complete version of what the user asked. Do not do the task yourself.
-After the tool result arrives, speak that result faithfully and conversationally.
-Keep spoken replies concise, but preserve important facts, warnings, and errors.
+You are the realtime spoken controller for Hermes, the computer agent running
+in this terminal. Decide how to handle each utterance:
+
+- Answer lightweight conversation yourself when no terminal, repository, web,
+  private session state, or computer action is needed.
+- For coding, files, shell commands, tests, research, or any other computer
+  work, call send_to_hermes once with a faithful and complete instruction.
+- For a progress question such as "what are you doing?" or "give me an update",
+  call get_hermes_status. Never invent Hermes progress.
+- When the user wants to modify the active task without cancelling it, call
+  steer_hermes. This corresponds to Hermes' /steer command.
+- When the user explicitly says "in the background", "by the way", or asks for
+  /btw, call start_background_task. This corresponds to /background or /btw and
+  runs in an independent session.
+- When the user explicitly wants the active Hermes task cancelled, call
+  stop_hermes. Merely interrupting your speech must not cancel Hermes.
+- If Hermes is waiting for an approval or clarification, relay the user's exact
+  answer through send_to_hermes. Never approve an action on the user's behalf.
+
+Useful command context: status/update checks progress; steer changes the active
+task after its next tool call; background/btw starts parallel work; stop cancels
+the foreground task. A new send_to_hermes request is queued when Hermes is busy.
+Never claim that a command ran until Hermes reports its result. Never request or
+repeat passwords, API keys, or other secrets; secure entry stays in the terminal.
+After a tool result arrives, speak it faithfully and conversationally. Keep
+spoken replies concise while preserving important facts, warnings, and errors.
 """
 
 S2S_TOOLS: list[dict[str, Any]] = [
@@ -39,9 +76,10 @@ S2S_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "send_to_hermes",
         "description": (
-            "Send the user's request to the Hermes agent in the current terminal "
-            "session. The tool acknowledges immediately; the result is announced "
-            "when Hermes finishes."
+            "Delegate coding, repository, file, shell, test, research, or other "
+            "computer work to Hermes in the current terminal session. Hermes "
+            "retains its normal command approvals. The tool acknowledges "
+            "immediately and announces the result when Hermes finishes."
         ),
         "parameters": {
             "type": "object",
@@ -53,7 +91,62 @@ S2S_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["message"],
         },
-    }
+    },
+    {
+        "type": "function",
+        "name": "get_hermes_status",
+        "description": (
+            "Get a truthful live progress update for the foreground Hermes turn, "
+            "including its current activity, elapsed time, prompts, and background "
+            "task count. Use this for status or progress questions."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "steer_hermes",
+        "description": (
+            "Add guidance to the currently running Hermes turn without cancelling "
+            "it. The guidance is injected after Hermes' next tool call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The new guidance for the active Hermes task.",
+                }
+            },
+            "required": ["message"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "stop_hermes",
+        "description": (
+            "Cancel the currently running foreground Hermes task. Use only when "
+            "the user explicitly wants the task stopped, not merely the speech."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "start_background_task",
+        "description": (
+            "Run a request in an independent Hermes background session, like "
+            "/background or /btw. Use only when parallel/background work is wanted."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The complete task to run in the background.",
+                }
+            },
+            "required": ["message"],
+        },
+    },
 ]
 
 
@@ -71,6 +164,15 @@ class S2STurnAck:
 
     message: str
     await_result: bool = True
+
+
+@dataclass(frozen=True)
+class S2SControlCall:
+    """A voice-side control action that does not become a normal CLI turn."""
+
+    name: str
+    call_id: str
+    message: str = ""
 
 
 @dataclass(frozen=True)
@@ -222,7 +324,7 @@ def build_session_update(config: S2SConfig) -> dict[str, Any]:
 
 
 def decode_hermes_turn(name: str, arguments: str | None, call_id: str) -> S2STurn | None:
-    """Decode the one tool exposed to the voice model."""
+    """Decode the delegation tool exposed to the voice model."""
     if name != "send_to_hermes" or not call_id:
         return None
     try:
@@ -233,7 +335,34 @@ def decode_hermes_turn(name: str, arguments: str | None, call_id: str) -> S2STur
     return S2STurn(message=message, call_id=call_id) if message else None
 
 
+_S2S_CONTROL_TOOLS = {
+    "get_hermes_status",
+    "steer_hermes",
+    "stop_hermes",
+    "start_background_task",
+}
+
+
+def decode_control_call(
+    name: str, arguments: str | None, call_id: str
+) -> S2SControlCall | None:
+    """Decode one of the scoped controls exposed only to the voice model."""
+    if name not in _S2S_CONTROL_TOOLS or not call_id:
+        return None
+    try:
+        data = json.loads(arguments or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    message = str(data.get("message") or "").strip()
+    if name in {"steer_hermes", "start_background_task"} and not message:
+        return None
+    return S2SControlCall(name=name, call_id=call_id, message=message)
+
+
 TurnCallback = Callable[[S2STurn], S2STurnAck | None]
+ControlCallback = Callable[[S2SControlCall], S2STurnAck | None]
 TranscriptCallback = Callable[[str, bool], None]
 StateCallback = Callable[[str, str], None]
 
@@ -246,11 +375,13 @@ class S2SMode:
         config: S2SConfig,
         *,
         on_turn: TurnCallback,
+        on_control: ControlCallback | None = None,
         on_transcript: TranscriptCallback | None = None,
         on_state: StateCallback | None = None,
     ) -> None:
         self.config = config
         self._on_turn = on_turn
+        self._on_control = on_control
         self._on_transcript = on_transcript
         self._on_state = on_state
         self._stop = threading.Event()
@@ -264,6 +395,9 @@ class S2SMode:
         self._speaker_active_until = 0.0
         self._seen_call_ids: set[str] = set()
         self._pending_results: set[str] = set()
+        self._acknowledged_call_ids: set[str] = set()
+        self._early_results: dict[str, str] = {}
+        self._result_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -310,12 +444,16 @@ class S2SMode:
         """Queue a completed Hermes result as a new spoken announcement."""
         if not call_id:
             return
-        text = (response or "Hermes did not return a response.").strip()
+        text = _safe_spoken_text(
+            response or "Hermes did not return a response."
+        ).strip()
         if len(text) > self.config.max_spoken_chars:
             text = text[: self.config.max_spoken_chars].rstrip() + " …(truncated)"
-        self._responses.put(
-            _S2SOutbound(kind="hermes_result", call_id=call_id, text=text)
-        )
+        with self._result_lock:
+            if call_id not in self._acknowledged_call_ids:
+                self._early_results[call_id] = text
+                return
+        self._responses.put(_S2SOutbound(kind="hermes_result", call_id=call_id, text=text))
 
     def _emit_state(self, state: str, detail: str = "") -> None:
         if self._on_state:
@@ -533,29 +671,52 @@ class S2SMode:
                 self._emit_state("speaking", "")
             elif event_type == "response.function_call_arguments.done":
                 turn = decode_hermes_turn(event.name, event.arguments, event.call_id)
-                if turn and turn.call_id not in self._seen_call_ids:
-                    self._seen_call_ids.add(turn.call_id)
+                control = decode_control_call(
+                    event.name, event.arguments, event.call_id
+                )
+                call = turn or control
+                if call and call.call_id not in self._seen_call_ids:
+                    self._seen_call_ids.add(call.call_id)
                     try:
-                        ack = self._on_turn(turn)
+                        if turn is not None:
+                            ack = self._on_turn(turn)
+                        elif self._on_control is not None:
+                            ack = self._on_control(control)
+                        else:
+                            ack = S2STurnAck(
+                                "That Hermes voice control is unavailable.",
+                                await_result=False,
+                            )
                     except Exception as exc:
-                        logger.exception("Could not route S2S turn to the CLI")
+                        logger.exception("Could not route S2S tool call to the CLI")
                         ack = S2STurnAck(
-                            f"Hermes could not accept the request: {exc}",
+                            f"Hermes could not perform that action: {exc}",
                             await_result=False,
                         )
                     if ack is None:
                         ack = S2STurnAck(
-                            "Hermes received the request and is working in the terminal."
+                            "Hermes accepted the voice action.", await_result=False
                         )
                     if ack.await_result:
-                        self._pending_results.add(turn.call_id)
+                        self._pending_results.add(call.call_id)
                     self._responses.put(
                         _S2SOutbound(
                             kind="tool_ack",
-                            call_id=turn.call_id,
-                            text=ack.message,
+                            call_id=call.call_id,
+                            text=_safe_spoken_text(ack.message),
                         )
                     )
+                    with self._result_lock:
+                        self._acknowledged_call_ids.add(call.call_id)
+                        early_result = self._early_results.pop(call.call_id, None)
+                    if early_result is not None:
+                        self._responses.put(
+                            _S2SOutbound(
+                                kind="hermes_result",
+                                call_id=call.call_id,
+                                text=early_result,
+                            )
+                        )
             elif event_type == "response.done":
                 if event.response.status == "cancelled":
                     self._clear_playback()
