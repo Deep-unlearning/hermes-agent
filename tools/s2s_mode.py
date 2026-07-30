@@ -50,8 +50,11 @@ in this terminal. Decide how to handle each utterance:
   private session state, or computer action is needed.
 - For coding, files, shell commands, tests, research, or any other computer
   work, call send_to_hermes once with a faithful and complete instruction.
-- For a progress question such as "what are you doing?" or "give me an update",
-  call get_hermes_status. Never invent Hermes progress.
+- After delegating work, remain available for unrelated conversation and
+  control requests while Hermes continues independently.
+- For a progress question such as "what are you doing?", "give me an update",
+  or "what is the status of the HF jobs setup?", call get_hermes_status. Pass
+  the user's task words when they identify a task. Never invent Hermes progress.
 - When the user wants to modify the active task without cancelling it, call
   steer_hermes. This corresponds to Hermes' /steer command.
 - When the user explicitly asks to queue work for later, call
@@ -65,8 +68,12 @@ in this terminal. Decide how to handle each utterance:
   user identified only one.
 - When the user explicitly wants the active Hermes task cancelled, call
   stop_hermes. Merely interrupting your speech must not cancel Hermes.
-- If Hermes is waiting for an approval or clarification, relay the user's exact
-  answer through send_to_hermes. Never approve an action on the user's behalf.
+- If Hermes is waiting for command approval and the user explicitly asks to
+  accept, approve, allow, reject, or deny it, call respond_to_hermes_approval.
+  This relays the user's own decision; it is not approval on their behalf.
+  Never choose a decision without an explicit user instruction.
+- If Hermes is waiting for clarification, relay the user's answer through
+  send_to_hermes.
 
 The safe Hermes command reference below is generated from the CLI's current
 command registry. A new send_to_hermes request is queued when Hermes is busy.
@@ -75,6 +82,11 @@ or repeat passwords, API keys, or other secrets; secure entry stays in the
 terminal. After a tool result arrives, speak it faithfully and conversationally.
 Keep spoken replies concise while preserving important facts, warnings, and
 errors.
+
+Hermes notifications are intentionally quiet: proactively speak only when
+Hermes needs command approval or when a task finishes successfully or
+unsuccessfully. Never volunteer periodic progress. Answer status questions
+when the user asks.
 """
 
 _VOICE_SAFE_COMMANDS = ("status", "background", "queue", "steer")
@@ -131,11 +143,46 @@ S2S_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "get_hermes_status",
         "description": (
-            "Get a truthful live progress update for the foreground Hermes turn, "
-            "including its current activity, elapsed time, prompts, and background "
-            "task count. Use this for status or progress questions."
+            "Get a truthful live status update. With no task, report foreground "
+            "activity and counts. When the user names work such as 'HF jobs setup', "
+            "pass those identifying words so Hermes can match foreground or "
+            "background work by its request text, number, or ID."
         ),
-        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "Optional task number, ID, or identifying words from "
+                        "the original request."
+                    ),
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "respond_to_hermes_approval",
+        "description": (
+            "Resolve Hermes' current command approval prompt using the user's "
+            "explicit spoken decision. Use 'once' for requests such as accept it, "
+            "approve it, allow it, or go ahead. Never call this without an "
+            "explicit user approval or denial."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["once", "session", "always", "deny"],
+                    "description": "The user's explicit approval decision.",
+                }
+            },
+            "required": ["decision"],
+            "additionalProperties": False,
+        },
     },
     {
         "type": "function",
@@ -205,14 +252,17 @@ S2S_TOOLS: list[dict[str, Any]] = [
         "name": "get_background_tasks",
         "description": (
             "List running and recently completed Hermes /background or /btw tasks, "
-            "or inspect one task by its number or ID."
+            "or inspect one by its number, ID, or words from the request."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Optional task number, full ID, or unique ID prefix.",
+                    "description": (
+                        "Optional task number, ID, unique ID prefix, or identifying "
+                        "words from the original request."
+                    ),
                 }
             },
         },
@@ -288,7 +338,7 @@ class S2SControlCall:
 
 @dataclass(frozen=True)
 class _S2SOutbound:
-    kind: str  # "tool_ack" | "hermes_result" | "progress"
+    kind: str  # "tool_ack" | "hermes_result" | "notice"
     call_id: str
     text: str
 
@@ -307,8 +357,6 @@ class S2SConfig:
     block_mic_during_playback: bool = False
     max_spoken_chars: int = 4000
     connect_timeout: float = 5.0
-    progress_announcements: bool = True
-    progress_interval: float = 30.0
     reconnect_enabled: bool = True
     reconnect_attempts: int = 0
     reconnect_initial_delay: float = 1.0
@@ -377,11 +425,6 @@ class S2SConfig:
             block_mic_during_playback=boolean("block_mic_during_playback", False),
             max_spoken_chars=integer("max_spoken_chars", cls.max_spoken_chars, minimum=1),
             connect_timeout=positive_number("connect_timeout", cls.connect_timeout),
-            progress_announcements=boolean("progress_announcements", True),
-            progress_interval=max(
-                5.0,
-                positive_number("progress_interval", cls.progress_interval),
-            ),
             reconnect_enabled=boolean("reconnect_enabled", True),
             reconnect_attempts=integer(
                 "reconnect_attempts", cls.reconnect_attempts, minimum=0, maximum=1000
@@ -477,6 +520,7 @@ def decode_hermes_turn(name: str, arguments: str | None, call_id: str) -> S2STur
 
 _S2S_CONTROL_TOOLS = {
     "get_hermes_status",
+    "respond_to_hermes_approval",
     "steer_hermes",
     "queue_hermes_task",
     "stop_hermes",
@@ -500,7 +544,12 @@ def decode_control_call(
     if not isinstance(data, dict):
         return None
     message = str(data.get("message") or "").strip()
-    task_id = str(data.get("task_id") or "").strip()
+    task_id = str(data.get("task") or data.get("task_id") or "").strip()
+    if name == "respond_to_hermes_approval":
+        decision = str(data.get("decision") or "").strip().lower()
+        if decision not in {"once", "session", "always", "deny"}:
+            return None
+        message = decision
     if name in {
         "steer_hermes",
         "queue_hermes_task",
@@ -520,9 +569,6 @@ TurnCallback = Callable[[S2STurn], S2STurnAck | None]
 ControlCallback = Callable[[S2SControlCall], S2STurnAck | None]
 TranscriptCallback = Callable[[str, bool], None]
 StateCallback = Callable[[str, str], None]
-ProgressCallback = Callable[[], str | None]
-
-
 class S2SMode:
     """Thread-owned Realtime connection and full-duplex audio streams."""
 
@@ -534,14 +580,12 @@ class S2SMode:
         on_control: ControlCallback | None = None,
         on_transcript: TranscriptCallback | None = None,
         on_state: StateCallback | None = None,
-        on_progress: ProgressCallback | None = None,
     ) -> None:
         self.config = config
         self._on_turn = on_turn
         self._on_control = on_control
         self._on_transcript = on_transcript
         self._on_state = on_state
-        self._on_progress = on_progress
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._connected = threading.Event()
@@ -558,8 +602,6 @@ class S2SMode:
         self._acknowledged_call_ids: set[str] = set()
         self._early_results: dict[str, str] = {}
         self._result_lock = threading.Lock()
-        self._progress_pending = False
-        self._progress_lock = threading.Lock()
         self._outbound_lock = threading.Lock()
         self._inflight_outbound: _S2SOutbound | None = None
         self._connected_at = 0.0
@@ -624,6 +666,15 @@ class S2SMode:
                 self._early_results[call_id] = text
                 return
         self._responses.put(_S2SOutbound(kind="hermes_result", call_id=call_id, text=text))
+
+    def announce_notice(self, text: str) -> None:
+        """Queue an immediate spoken Hermes state notification."""
+        spoken = _safe_spoken_text(text).strip()
+        if not spoken:
+            return
+        if len(spoken) > self.config.max_spoken_chars:
+            spoken = spoken[: self.config.max_spoken_chars].rstrip() + " …(truncated)"
+        self._responses.put(_S2SOutbound(kind="notice", call_id="", text=spoken))
 
     def _emit_state(self, state: str, detail: str = "") -> None:
         if self._on_state:
@@ -772,14 +823,23 @@ class S2SMode:
 
                 response_idle = asyncio.Event()
                 response_idle.set()
+                response_create_outcomes: asyncio.Queue[tuple[str, str]] = (
+                    asyncio.Queue()
+                )
                 tasks = {
                     asyncio.create_task(self._send_audio(conn)),
-                    asyncio.create_task(self._receive_events(conn, response_idle)),
-                    asyncio.create_task(self._send_responses(conn, response_idle)),
+                    asyncio.create_task(
+                        self._receive_events(
+                            conn, response_idle, response_create_outcomes
+                        )
+                    ),
+                    asyncio.create_task(
+                        self._send_responses(
+                            conn, response_idle, response_create_outcomes
+                        )
+                    ),
                     asyncio.create_task(self._wait_for_stop()),
                 }
-                if self.config.progress_announcements and self._on_progress:
-                    tasks.add(asyncio.create_task(self._announce_progress()))
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
@@ -804,42 +864,6 @@ class S2SMode:
                     pass
             await client.close()
 
-    async def _announce_progress(self) -> None:
-        """Queue one fresh spoken progress update per configured interval."""
-        active_since: float | None = None
-        last_announcement = 0.0
-        interval = max(5.0, self.config.progress_interval)
-        while not self._stop.is_set():
-            await asyncio.sleep(min(1.0, interval))
-            if self._on_progress is None:
-                return
-            try:
-                status = await asyncio.to_thread(self._on_progress)
-            except Exception:
-                logger.debug("S2S progress callback failed", exc_info=True)
-                status = None
-            now = time.monotonic()
-            if not status:
-                active_since = None
-                continue
-            if active_since is None:
-                active_since = now
-                continue
-            if now - active_since < interval or now - last_announcement < interval:
-                continue
-            with self._progress_lock:
-                if self._progress_pending:
-                    continue
-                self._progress_pending = True
-            self._responses.put(
-                _S2SOutbound(
-                    kind="progress",
-                    call_id="",
-                    text=_safe_spoken_text(status),
-                )
-            )
-            last_announcement = now
-
     async def _wait_for_stop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(0.1)
@@ -857,7 +881,24 @@ class S2SMode:
                 }
             )
 
-    async def _send_responses(self, conn, response_idle: asyncio.Event) -> None:
+    async def _send_responses(
+        self,
+        conn,
+        response_idle: asyncio.Event,
+        response_create_outcomes: asyncio.Queue[tuple[str, str]] | None = None,
+    ) -> None:
+        """Inject queued Hermes output and serialize explicit responses.
+
+        The local realtime server automatically starts a response after a voice
+        transcription. Tool-only responses can emit their function call before
+        ``response.created``, so ``response_idle`` alone cannot close that race.
+        Each explicit create carries an ID in response metadata and waits for a
+        matching acknowledgement. If an implicit response won the race, retry
+        only ``response.create`` after it finishes; the conversation item was
+        already injected (or safely deferred by the server).
+        """
+        outcomes = response_create_outcomes or asyncio.Queue()
+        response_sequence = 0
         while not self._stop.is_set():
             try:
                 outbound = await asyncio.to_thread(self._responses.get, True, 0.1)
@@ -866,27 +907,6 @@ class S2SMode:
             with self._outbound_lock:
                 self._inflight_outbound = outbound
             await response_idle.wait()
-            if outbound.kind == "progress":
-                try:
-                    current_progress = (
-                        await asyncio.to_thread(self._on_progress)
-                        if self._on_progress is not None
-                        else None
-                    )
-                except Exception:
-                    logger.debug("S2S progress refresh failed", exc_info=True)
-                    current_progress = None
-                if not current_progress:
-                    with self._progress_lock:
-                        self._progress_pending = False
-                    with self._outbound_lock:
-                        self._inflight_outbound = None
-                    continue
-                outbound = _S2SOutbound(
-                    kind="progress",
-                    call_id="",
-                    text=_safe_spoken_text(current_progress),
-                )
 
             if outbound.kind == "tool_ack":
                 item = {
@@ -898,7 +918,7 @@ class S2SMode:
                     "Briefly acknowledge the tool result to the user. "
                     "Do not call another tool."
                 )
-            elif outbound.kind == "progress":
+            elif outbound.kind == "notice":
                 item = {
                     "type": "message",
                     "role": "user",
@@ -906,15 +926,15 @@ class S2SMode:
                         {
                             "type": "input_text",
                             "text": (
-                                "[HERMES PROGRESS — automated status, not a new "
-                                "user request] " + outbound.text
+                                "[HERMES NOTICE — automated state notification, "
+                                "not a new user request] " + outbound.text
                             ),
                         }
                     ],
                 }
                 instructions = (
-                    "Speak this as one short, factual progress update. Do not "
-                    "infer that the task is complete and do not call a tool."
+                    "Speak this Hermes notice immediately and faithfully. "
+                    "Do not call a tool."
                 )
             else:
                 item = {
@@ -934,20 +954,41 @@ class S2SMode:
                     "Speak the automated Hermes result faithfully and concisely. "
                     "Do not call another tool."
                 )
+            response_sequence += 1
+            request_id = f"hermes-{response_sequence}"
+            create_event = {
+                "type": "response.create",
+                "response": {
+                    "tool_choice": "none",
+                    "instructions": instructions,
+                    "metadata": {"hermes_request_id": request_id},
+                },
+            }
             try:
-                await conn.send(
-                    {"type": "conversation.item.create", "item": item}
-                )
-                response_idle.clear()
-                await conn.send(
-                    {
-                        "type": "response.create",
-                        "response": {
-                            "tool_choice": "none",
-                            "instructions": instructions,
-                        },
-                    }
-                )
+                await conn.send({"type": "conversation.item.create", "item": item})
+                while not self._stop.is_set():
+                    await response_idle.wait()
+                    response_idle.clear()
+                    await conn.send(create_event)
+                    if self._stop.is_set():
+                        break
+
+                    accepted = False
+                    while not self._stop.is_set():
+                        outcome, outcome_request_id = await outcomes.get()
+                        if outcome == "created":
+                            if outcome_request_id != request_id:
+                                continue
+                            accepted = True
+                            break
+                        if outcome == "active_response":
+                            break
+                    if accepted or self._stop.is_set():
+                        break
+                    logger.debug(
+                        "S2S response.create raced an implicit response; "
+                        "retrying after response.done"
+                    )
             except Exception:
                 if outbound.kind != "tool_ack":
                     self._responses.put(outbound)
@@ -956,27 +997,49 @@ class S2SMode:
                 raise
             if outbound.kind == "hermes_result":
                 self._pending_results.discard(outbound.call_id)
-            elif outbound.kind == "progress":
-                with self._progress_lock:
-                    self._progress_pending = False
             with self._outbound_lock:
                 self._inflight_outbound = None
 
-    async def _receive_events(self, conn, response_idle: asyncio.Event) -> None:
+    async def _receive_events(
+        self,
+        conn,
+        response_idle: asyncio.Event,
+        response_create_outcomes: asyncio.Queue[tuple[str, str]] | None = None,
+    ) -> None:
         while not self._stop.is_set():
             event = await conn.recv()
             event_type = event.type
             if event_type == "input_audio_buffer.speech_started":
+                # A voice turn automatically starts generation. Reserve the
+                # response slot before its delayed response.created event.
+                response_idle.clear()
                 self._clear_playback()
                 self._emit_transcript("", False)
                 self._emit_state("listening", "")
             elif event_type == "conversation.item.input_audio_transcription.delta":
                 self._emit_transcript(event.delta.strip(), False)
             elif event_type == "conversation.item.input_audio_transcription.completed":
-                self._emit_transcript(event.transcript.strip(), True)
+                transcript = event.transcript.strip()
+                self._emit_transcript(transcript, True)
+                if transcript:
+                    response_idle.clear()
+                else:
+                    # Empty transcriptions do not trigger an implicit response.
+                    response_idle.set()
             elif event_type == "response.created":
                 response_idle.clear()
+                metadata = getattr(event.response, "metadata", None)
+                request_id = (
+                    metadata.get("hermes_request_id")
+                    if isinstance(metadata, Mapping)
+                    else None
+                )
+                if response_create_outcomes is not None and request_id:
+                    response_create_outcomes.put_nowait(
+                        ("created", str(request_id))
+                    )
             elif event_type == "response.output_audio.delta":
+                response_idle.clear()
                 audio = base64.b64decode(event.delta)
                 with self._playback_lock:
                     self._playback.extend(audio)
@@ -985,6 +1048,9 @@ class S2SMode:
                 )
                 self._emit_state("speaking", "")
             elif event_type == "response.function_call_arguments.done":
+                # Tool-only implicit responses may never emit response.created.
+                # Keep their function output queued until response.done.
+                response_idle.clear()
                 turn = decode_hermes_turn(event.name, event.arguments, event.call_id)
                 control = decode_control_call(
                     event.name, event.arguments, event.call_id
@@ -1038,6 +1104,22 @@ class S2SMode:
                 response_idle.set()
                 self._emit_state("working" if self._pending_results else "listening", "")
             elif event_type == "error":
+                error_kind = (
+                    getattr(event.error, "code", None)
+                    or getattr(event.error, "type", "")
+                )
+                if error_kind == "conversation_already_has_active_response":
+                    # This is a recoverable scheduling race, not a connection
+                    # failure. The sender retains the injected item and retries
+                    # response.create once the active implicit response is done.
+                    if response_create_outcomes is not None:
+                        response_create_outcomes.put_nowait(
+                            ("active_response", "")
+                        )
+                    logger.debug(
+                        "S2S response.create deferred because a response is active"
+                    )
+                    continue
                 response_idle.set()
                 message = f"{event.error.type}: {event.error.message}"
                 self._emit_state("error", message)

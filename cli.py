@@ -4199,6 +4199,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._s2s_state = "off"
         self._s2s_partial = ""
         self._s2s_last_error = ""
+        self._s2s_active_task = None
+        self._s2s_recent_task = None
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -11040,6 +11042,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if mode and mode.is_running:
             mode.deliver_response(call_id, response)
 
+    def _begin_s2s_task(self, call_id: str, prompt: str) -> None:
+        """Record the foreground voice task consumed by the CLI loop."""
+        self._s2s_active_task = {
+            "call_id": call_id,
+            "prompt": prompt,
+            "status": "running",
+            "started_at": time.time(),
+            "finished_at": None,
+            "response": "",
+        }
+
+    def _finish_s2s_task(
+        self,
+        call_id: str | None,
+        response: str | None,
+        *,
+        interrupted: bool = False,
+    ) -> None:
+        """Move a completed foreground voice task into recent status."""
+        if not call_id:
+            return
+        active = getattr(self, "_s2s_active_task", None)
+        if not isinstance(active, dict) or active.get("call_id") != call_id:
+            return
+        active["status"] = (
+            "cancelled"
+            if interrupted
+            else "completed"
+            if response
+            else "finished"
+        )
+        active["finished_at"] = time.time()
+        active["response"] = response or ""
+        self._s2s_recent_task = dict(active)
+        self._s2s_active_task = None
+
     @staticmethod
     def _format_s2s_elapsed(seconds: float) -> str:
         elapsed = max(0, int(seconds))
@@ -11102,34 +11140,68 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"{detail}{queue_detail}{background}"
         )
 
-    def _get_s2s_progress_announcement(self) -> str | None:
-        """Return fresh work status, or None when there is nothing to announce."""
-        if (
-            getattr(self, "_agent_running", False)
-            or getattr(self, "_approval_state", None)
-            or getattr(self, "_clarify_state", None)
-            or getattr(self, "_sudo_state", None)
-            or getattr(self, "_secret_state", None)
+    def _get_s2s_task_status(self, reference: str) -> str:
+        """Resolve a spoken task description across foreground and /btw work."""
+        active = getattr(self, "_s2s_active_task", None)
+        if isinstance(active, dict) and self._task_reference_score(
+            reference, str(active.get("prompt") or "")
         ):
-            return self._get_s2s_live_status()
+            prompt = " ".join(str(active.get("prompt") or "").split())[:120]
+            return f"For the task {prompt}: {self._get_s2s_live_status()}"
 
-        registry, lock = self._ensure_background_task_registry()
-        with lock:
-            active = [
-                str(record.get("task_id")) for record in registry.values()
-                if record.get("status") in {"running", "stopping"}
-            ]
-        if not active:
-            return None
-        details = [self._background_task_status_text(task_id) for task_id in active[:3]]
-        return "Background progress: " + " ".join(details)
+        record, _error = self._resolve_background_task_info(reference)
+        if record is not None:
+            return self._background_task_status_text(str(record["task_id"]))
+
+        recent = getattr(self, "_s2s_recent_task", None)
+        if isinstance(recent, dict) and self._task_reference_score(
+            reference, str(recent.get("prompt") or "")
+        ):
+            prompt = " ".join(str(recent.get("prompt") or "").split())[:120]
+            status = str(recent.get("status") or "finished")
+            result = " ".join(str(recent.get("response") or "").split())[:300]
+            answer = f"The task {prompt} is {status}."
+            return answer + (f" Result: {result}" if result else "")
+
+        return f"No foreground or background Hermes task matches {reference}."
 
     def _on_s2s_control(self, call):
         """Execute a scoped voice control without bypassing Hermes safeguards."""
         from tools.s2s_mode import S2STurn, S2STurnAck
 
         if call.name == "get_hermes_status":
-            return S2STurnAck(self._get_s2s_live_status(), await_result=False)
+            status = (
+                self._get_s2s_task_status(call.task_id)
+                if call.task_id
+                else self._get_s2s_live_status()
+            )
+            return S2STurnAck(status, await_result=False)
+
+        if call.name == "respond_to_hermes_approval":
+            approval = getattr(self, "_approval_state", None)
+            if not isinstance(approval, dict):
+                return S2STurnAck(
+                    "Hermes is not waiting for command approval.",
+                    await_result=False,
+                )
+            choices = approval.get("choices")
+            choices = choices if isinstance(choices, list) else []
+            decision = call.message
+            if decision not in choices:
+                return S2STurnAck(
+                    f"The {decision} approval option is not available for this command. "
+                    "Say approve once or deny.",
+                    await_result=False,
+                )
+            approval["response_queue"].put(decision)
+            self._approval_state = None
+            self._invalidate(min_interval=0.0)
+            acknowledgement = (
+                "Approved the command once." if decision == "once" else
+                "Denied the command." if decision == "deny" else
+                f"Approved the command for {decision}."
+            )
+            return S2STurnAck(acknowledgement, await_result=False)
 
         if call.name == "steer_hermes":
             agent = getattr(self, "agent", None)
@@ -11276,10 +11348,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._invalidate(min_interval=0.0)
         if was_busy:
             return S2STurnAck(
-                "Hermes is still working, so I queued your request as the next CLI turn."
+                "Hermes is still working, so I queued your request as the next CLI turn.",
+                await_result=True,
             )
         return S2STurnAck(
-            "Hermes received your request and is working in the terminal."
+            "Hermes received your request and is working in the terminal. "
+            "You can keep talking or ask for its status.",
+            await_result=True,
         )
 
     def _enable_s2s_mode(self) -> None:
@@ -11315,7 +11390,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             on_control=self._on_s2s_control,
             on_transcript=self._on_s2s_transcript,
             on_state=self._on_s2s_state,
-            on_progress=self._get_s2s_progress_announcement,
         )
         self._s2s_mode = mode
         self._s2s_last_error = ""
@@ -11337,6 +11411,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 f"reconnection is automatic.{_RST}"
             )
         _cprint(f"  {_DIM}Voice turns now run in this CLI session with live tool updates.{_RST}")
+        _cprint(
+            f"  {_DIM}Notifications are quiet: approvals and final task "
+            f"outcomes only; progress is on demand.{_RST}"
+        )
         _cprint(f"  {_DIM}/s2s off to disconnect.{_RST}")
 
     def _disable_s2s_mode(self) -> None:
@@ -11363,9 +11441,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"  Model:    {config.model}")
         _cprint(f"  Voice:    {config.voice or 'server default'}")
         _cprint(f"  Audio:    {config.send_rate} Hz in / {config.recv_rate} Hz out")
-        _cprint(
-            f"  Progress: {'every ' + f'{config.progress_interval:g}s' if config.progress_announcements else 'off'}"
-        )
+        _cprint("  Notices:  approvals and final task outcomes")
+        _cprint("  Progress: on demand")
         _cprint(
             f"  Reconnect: {'on' if config.reconnect_enabled else 'off'}"
             f" ({'unlimited' if config.reconnect_attempts == 0 else config.reconnect_attempts} attempts)"
@@ -11984,6 +12061,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the command is denied on timeout without the user ever seeing it
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
+            mode = getattr(self, "_s2s_mode", None)
+            if mode and mode.is_running:
+                spoken_choices = ["approve once"]
+                if "session" in self._approval_state["choices"]:
+                    spoken_choices.append("approve for this session")
+                if "always" in self._approval_state["choices"]:
+                    spoken_choices.append("always allow")
+                spoken_choices.append("deny")
+                mode.announce_notice(
+                    "Hermes needs permission to run a command. Say "
+                    + ", ".join(spoken_choices[:-1])
+                    + ", or "
+                    + spoken_choices[-1]
+                    + "."
+                )
 
             _last_countdown_refresh = _time.monotonic()
             while True:
@@ -13727,6 +13819,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._s2s_state = "off"
         self._s2s_partial = ""
         self._s2s_last_error = ""
+        self._s2s_active_task = None
+        self._s2s_recent_task = None
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
@@ -15587,6 +15681,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if isinstance(user_input, S2STurn):
                             s2s_call_id = user_input.call_id
                             user_input = user_input.message
+                            self._begin_s2s_task(s2s_call_id, user_input)
                     except ImportError:
                         pass
 
@@ -15684,6 +15779,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         response = self.chat(user_input, images=submit_images or None)
                     finally:
                         self._complete_s2s_turn(s2s_call_id, response)
+                        self._finish_s2s_task(
+                            s2s_call_id,
+                            response,
+                            interrupted=self._last_turn_interrupted,
+                        )
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0

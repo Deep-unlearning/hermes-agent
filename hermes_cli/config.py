@@ -2303,8 +2303,6 @@ DEFAULT_CONFIG = {
         "block_mic_during_playback": False,
         "max_spoken_chars": 4000,
         "connect_timeout": 5.0,
-        "progress_announcements": True,
-        "progress_interval": 30.0,
         "reconnect_enabled": True,
         "reconnect_attempts": 0,
         "reconnect_initial_delay": 1.0,

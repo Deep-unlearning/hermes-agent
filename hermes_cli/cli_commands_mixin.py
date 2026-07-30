@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -1661,6 +1662,54 @@ class CLICommandsMixin:
             return "current"
         return number_words.get(value, value)
 
+    @staticmethod
+    def _task_reference_terms(value: str) -> set[str]:
+        """Extract stable terms for matching spoken task descriptions."""
+        stop_words = {
+            "a", "an", "and", "about", "for", "how", "is", "it", "me",
+            "of", "on", "please", "progress", "status", "task", "the", "to",
+            "update", "what", "whats", "with",
+        }
+        aliases = {
+            "configure": "config",
+            "configured": "config",
+            "configuring": "config",
+            "configuration": "config",
+            "installing": "install",
+            "installed": "install",
+            "setting": "set",
+            "setup": "set",
+        }
+        terms: set[str] = set()
+        for raw_term in re.findall(r"[a-z0-9]+", str(value or "").lower()):
+            term = aliases.get(raw_term, raw_term)
+            if term in stop_words or len(term) < 2:
+                continue
+            if len(term) > 3 and term.endswith("ies"):
+                term = term[:-3] + "y"
+            elif len(term) > 3 and term.endswith("s") and not term.endswith("ss"):
+                term = term[:-1]
+            terms.add(term)
+        return terms
+
+    @classmethod
+    def _task_reference_score(cls, reference: str, prompt: str):
+        """Return a relevance score for a natural-language task reference."""
+        query_terms = cls._task_reference_terms(reference)
+        prompt_terms = cls._task_reference_terms(prompt)
+        if not query_terms or not prompt_terms:
+            return None
+        overlap = query_terms & prompt_terms
+        minimum = 1 if len(query_terms) == 1 else max(
+            2, (len(query_terms) + 1) // 2
+        )
+        if len(overlap) < minimum:
+            return None
+        coverage = len(overlap) / len(query_terms)
+        if coverage < 0.6:
+            return None
+        return (coverage, len(overlap), -len(prompt_terms))
+
     def _resolve_background_task_info(self, reference: str):
         registry, lock = self._ensure_background_task_registry()
         normalized = self._normalize_background_task_reference(reference)
@@ -1694,6 +1743,28 @@ class CLICommandsMixin:
                     record for record in records
                     if str(record.get("task_id", "")).lower().startswith(normalized)
                 ]
+            if not matches:
+                scored = [
+                    (
+                        self._task_reference_score(
+                            normalized, str(record.get("prompt") or "")
+                        ),
+                        record,
+                    )
+                    for record in records
+                ]
+                scored = [
+                    (score, record)
+                    for score, record in scored
+                    if score is not None
+                ]
+                if scored:
+                    best_score = max(score for score, _record in scored)
+                    matches = [
+                        record
+                        for score, record in scored
+                        if score == best_score
+                    ]
         if len(matches) == 1:
             return matches[0], ""
         if len(matches) > 1:
